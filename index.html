@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+<title>Mythic Maze TD - Phone Beta</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #101018;
+    color: white;
+    font-family: Arial, sans-serif;
+    touch-action: none;
+    overflow: hidden;
+  }
+  #ui {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    background: rgba(0,0,0,.72);
+    padding: 8px;
+    font-size: 13px;
+    z-index: 5;
+  }
+  #buttons {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: rgba(0,0,0,.78);
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 6px;
+    padding: 8px;
+    z-index: 5;
+  }
+  button {
+    padding: 10px 5px;
+    border: 1px solid #777;
+    border-radius: 8px;
+    background: #24243a;
+    color: white;
+    font-size: 12px;
+  }
+  button.active {
+    background: #4b68ff;
+  }
+  button:disabled {
+    opacity: .45;
+  }
+  canvas {
+    display: block;
+    background: #1c1c2b;
+  }
+  #msg {
+    position: fixed;
+    top: 72px;
+    left: 8px;
+    right: 8px;
+    text-align: center;
+    color: #ffd86b;
+    font-weight: bold;
+    pointer-events: none;
+    z-index: 4;
+  }
+</style>
+</head>
+<body>
+<div id="ui">
+  <div><b>Mythic Maze TD Beta</b></div>
+  <div id="stats"></div>
+</div>
+<div id="msg"></div>
+<canvas id="game"></canvas>
+<div id="buttons">
+  <button id="basicBtn">Basic<br>$25</button>
+  <button id="sniperBtn">Sniper<br>$40</button>
+  <button id="slowBtn">Slow<br>$35</button>
+  <button id="readyBtn">Ready</button>
+</div>
+
+<script>
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const stats = document.getElementById("stats");
+const msg = document.getElementById("msg");
+
+let W, H, TILE, COLS, ROWS, topPad = 70, bottomPad = 82;
+function resize(){
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width = W;
+  canvas.height = H;
+  TILE = Math.floor(Math.min(W / 10, (H - topPad - bottomPad) / 14));
+  COLS = Math.floor(W / TILE);
+  ROWS = Math.floor((H - topPad - bottomPad) / TILE);
+}
+window.addEventListener("resize", resize);
+resize();
+
+const spawn = {x: 0, y: Math.floor(ROWS/2)};
+const base = {x: COLS-1, y: Math.floor(ROWS/2)};
+
+let gold = 120;
+let lives = 20;
+let level = 1;
+let phase = "BUILD";
+let buildTimer = 20;
+let selected = "basic";
+let towers = [];
+let enemies = [];
+let shots = [];
+let waveSpawning = false;
+let messageTimer = 0;
+
+const towerDefs = {
+  basic: {cost:25, range:3, dmg:3, rate:0.75, color:"#62a8ff"},
+  sniper:{cost:40, range:5, dmg:8, rate:1.6, color:"#ff6262"},
+  slow:  {cost:35, range:3, dmg:1, rate:1.0, color:"#62ff9a", slow:0.45}
+};
+
+function show(text){
+  msg.textContent = text;
+  messageTimer = 2.2;
+}
+
+function key(x,y){ return x+","+y; }
+
+function blockedSet(extraTower=null){
+  const set = new Set();
+  for(const t of towers) set.add(key(t.x,t.y));
+  if(extraTower) set.add(key(extraTower.x, extraTower.y));
+  return set;
+}
+
+function findPath(extraTower=null){
+  const blocked = blockedSet(extraTower);
+  if(blocked.has(key(spawn.x,spawn.y)) || blocked.has(key(base.x,base.y))) return null;
+  const q = [spawn];
+  const came = {};
+  const seen = new Set([key(spawn.x, spawn.y)]);
+  const dirs = [[1,0],[-1,0],[0,1],[0,-1]];
+  while(q.length){
+    const cur = q.shift();
+    if(cur.x === base.x && cur.y === base.y){
+      const path = [];
+      let k = key(cur.x,cur.y);
+      let p = cur;
+      while(p){
+        path.push({x:p.x,y:p.y});
+        const prev = came[key(p.x,p.y)];
+        p = prev;
+      }
+      return path.reverse();
+    }
+    for(const [dx,dy] of dirs){
+      const nx = cur.x+dx, ny = cur.y+dy;
+      const nk = key(nx,ny);
+      if(nx<0 || ny<0 || nx>=COLS || ny>=ROWS) continue;
+      if(blocked.has(nk) || seen.has(nk)) continue;
+      seen.add(nk);
+      came[nk] = cur;
+      q.push({x:nx,y:ny});
+    }
+  }
+  return null;
+}
+
+function placeTower(tx,ty){
+  if(phase !== "BUILD") return show("Building is locked during combat.");
+  if(tx<0 || ty<0 || tx>=COLS || ty>=ROWS) return;
+  if((tx===spawn.x && ty===spawn.y) || (tx===base.x && ty===base.y)) return show("Can't build there.");
+  if(towers.some(t=>t.x===tx && t.y===ty)) return show("Tile already has a tower.");
+
+  const def = towerDefs[selected];
+  if(gold < def.cost) return show("Not enough gold.");
+
+  if(!findPath({x:tx,y:ty})) return show("Path blocked. Leave monsters a path.");
+
+  gold -= def.cost;
+  towers.push({x:tx,y:ty,type:selected,cool:0});
+}
+
+canvas.addEventListener("pointerdown", e => {
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  const my = e.clientY - rect.top - topPad;
+  const tx = Math.floor(mx / TILE);
+  const ty = Math.floor(my / TILE);
+  placeTower(tx,ty);
+});
+
+document.getElementById("basicBtn").onclick = () => selectTower("basic");
+document.getElementById("sniperBtn").onclick = () => selectTower("sniper");
+document.getElementById("slowBtn").onclick = () => selectTower("slow");
+document.getElementById("readyBtn").onclick = () => startCombat();
+
+function selectTower(t){
+  selected = t;
+  for(const id of ["basicBtn","sniperBtn","slowBtn"]) document.getElementById(id).classList.remove("active");
+  document.getElementById(t+"Btn").classList.add("active");
+}
+selectTower("basic");
+
+function startCombat(){
+  if(phase !== "BUILD") return;
+  phase = "COMBAT";
+  buildTimer = 20;
+  spawnWave();
+}
+
+function spawnWave(){
+  if(waveSpawning) return;
+  waveSpawning = true;
+  const count = 6 + level * 2;
+  let spawned = 0;
+  const interval = setInterval(() => {
+    if(spawned >= count){
+      clearInterval(interval);
+      waveSpawning = false;
+      return;
+    }
+    const path = findPath();
+    if(!path) return;
+    const hp = 8 + level * 3;
+    const speed = 1.4 + Math.min(level * 0.05, 0.8);
+    enemies.push({
+      x: spawn.x + .5,
+      y: spawn.y + .5,
+      hp, maxHp: hp,
+      speed,
+      path,
+      index: 0,
+      slowTimer:0,
+      slowMult:1
+    });
+    spawned++;
+  }, 650);
+}
+
+function nextBuildPhase(){
+  level++;
+  phase = "BUILD";
+  buildTimer = level <= 10 ? 20 : 15;
+  gold += 25 + level * 4;
+  if(level === 11) show("Level 11+: waves will auto-start when timer ends.");
+}
+
+function update(dt){
+  if(messageTimer > 0){
+    messageTimer -= dt;
+    if(messageTimer <= 0) msg.textContent = "";
+  }
+
+  if(phase === "BUILD"){
+    buildTimer -= dt;
+    if(level <= 10) {
+      document.getElementById("readyBtn").disabled = false;
+      document.getElementById("readyBtn").textContent = "Ready";
+      if(buildTimer <= 0) startCombat();
+    } else {
+      document.getElementById("readyBtn").disabled = true;
+      document.getElementById("readyBtn").textContent = "Auto";
+      if(buildTimer <= 0) startCombat();
+    }
+  } else {
+    document.getElementById("readyBtn").disabled = true;
+    document.getElementById("readyBtn").textContent = "Combat";
+  }
+
+  for(const e of enemies){
+    if(e.slowTimer > 0){
+      e.slowTimer -= dt;
+      if(e.slowTimer <= 0) e.slowMult = 1;
+    }
+    const target = e.path[Math.min(e.index, e.path.length-1)];
+    const tx = target.x + .5, ty = target.y + .5;
+    const dx = tx - e.x, dy = ty - e.y;
+    const dist = Math.hypot(dx,dy);
+    if(dist < 0.04){
+      e.index++;
+      if(e.index >= e.path.length){
+        e.reached = true;
+        lives--;
+      }
+    } else {
+      const move = e.speed * e.slowMult * dt;
+      e.x += dx / dist * move;
+      e.y += dy / dist * move;
+    }
+  }
+  enemies = enemies.filter(e => !e.reached && e.hp > 0);
+
+  for(const t of towers){
+    t.cool -= dt;
+    const def = towerDefs[t.type];
+    if(t.cool <= 0){
+      let best = null, bestDist = Infinity;
+      for(const e of enemies){
+        const d = Math.hypot(e.x-(t.x+.5), e.y-(t.y+.5));
+        if(d <= def.range && d < bestDist){
+          best = e; bestDist = d;
+        }
+      }
+      if(best){
+        best.hp -= def.dmg;
+        if(def.slow){
+          best.slowMult = def.slow;
+          best.slowTimer = 1.2;
+        }
+        shots.push({x1:t.x+.5,y1:t.y+.5,x2:best.x,y2:best.y,life:.12,color:def.color});
+        t.cool = def.rate;
+        if(best.hp <= 0) gold += 3 + Math.floor(level/3);
+      }
+    }
+  }
+
+  shots.forEach(s => s.life -= dt);
+  shots = shots.filter(s => s.life > 0);
+
+  if(phase === "COMBAT" && !waveSpawning && enemies.length === 0){
+    nextBuildPhase();
+  }
+
+  if(lives <= 0){
+    phase = "GAME OVER";
+    show("Game Over. Refresh to restart beta.");
+  }
+}
+
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  ctx.save();
+  ctx.translate(0, topPad);
+
+  // grid
+  ctx.strokeStyle = "#303045";
+  ctx.lineWidth = 1;
+  for(let x=0; x<=COLS; x++){
+    ctx.beginPath(); ctx.moveTo(x*TILE,0); ctx.lineTo(x*TILE,ROWS*TILE); ctx.stroke();
+  }
+  for(let y=0; y<=ROWS; y++){
+    ctx.beginPath(); ctx.moveTo(0,y*TILE); ctx.lineTo(COLS*TILE,y*TILE); ctx.stroke();
+  }
+
+  // path preview
+  const path = findPath();
+  if(path){
+    ctx.fillStyle = "rgba(255,255,255,.08)";
+    for(const p of path) ctx.fillRect(p.x*TILE, p.y*TILE, TILE, TILE);
+  }
+
+  // spawn/base
+  ctx.fillStyle = "#7cff7c";
+  ctx.fillRect(spawn.x*TILE+4, spawn.y*TILE+4, TILE-8, TILE-8);
+  ctx.fillStyle = "#ffde59";
+  ctx.fillRect(base.x*TILE+4, base.y*TILE+4, TILE-8, TILE-8);
+
+  // towers
+  for(const t of towers){
+    const def = towerDefs[t.type];
+    ctx.fillStyle = def.color;
+    ctx.beginPath();
+    ctx.arc((t.x+.5)*TILE, (t.y+.5)*TILE, TILE*.35, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  // enemies
+  for(const e of enemies){
+    ctx.fillStyle = "#d36bff";
+    ctx.beginPath();
+    ctx.arc(e.x*TILE, e.y*TILE, TILE*.28, 0, Math.PI*2);
+    ctx.fill();
+
+    ctx.fillStyle = "#000";
+    ctx.fillRect((e.x-.35)*TILE, (e.y-.55)*TILE, TILE*.7, 4);
+    ctx.fillStyle = "#ff4b4b";
+    ctx.fillRect((e.x-.35)*TILE, (e.y-.55)*TILE, TILE*.7*(e.hp/e.maxHp), 4);
+  }
+
+  // shots
+  for(const s of shots){
+    ctx.strokeStyle = s.color;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(s.x1*TILE, s.y1*TILE);
+    ctx.lineTo(s.x2*TILE, s.y2*TILE);
+    ctx.stroke();
+  }
+
+  ctx.restore();
+
+  stats.textContent = `Level ${level} | Phase: ${phase} | Gold: ${gold} | Lives: ${lives} | Build Timer: ${Math.max(0, buildTimer).toFixed(0)}s | Selected: ${selected}`;
+}
+
+let last = performance.now();
+function loop(now){
+  const dt = Math.min((now-last)/1000, .05);
+  last = now;
+  if(phase !== "GAME OVER") update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
